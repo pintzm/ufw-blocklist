@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily UFW blocklist update
+
+[Timer]
+# Run every day at 03:17 (system local time)
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

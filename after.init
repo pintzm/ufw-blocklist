@@ -1,0 +1,244 @@
+#!/bin/sh
+#
+# after.init: if executable, called by ufw-init. See 'man ufw-framework' for
+#             details. Note that output from these scripts is not seen via the
+#             the ufw command, but instead via ufw-init.
+#
+# Copyright 2013 Canonical Ltd.
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License version 3,
+#    as published by the Free Software Foundation.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Custom file -------------------------------------------------------
+# Blocklist via ipset + BLOCKLIST chain.
+# - Reads /etc/ufw/blocklist.txt (IPv4; optional: blocklist6.txt for IPv6)
+# - Ensures a BLOCKLIST jump right after loopback in ufw-before-input
+# - Drops sources in 'blocklist' ipset (and 'blocklist6' for IPv6)
+#
+# Safe: only adds DROP/jump rules; never ACCEPT.
+set -eu
+
+# ---- Config ----
+IP_FILE="/etc/ufw/blocklist.txt"
+IP6_FILE="/etc/ufw/blocklist6.txt"      # optional
+SET_V4="blocklist"
+SET_V6="blocklist6"
+CHAIN_V4="BLOCKLIST"
+CHAIN_V6="BLOCKLIST6"
+STATE_V4="/var/lib/ufw-blocklist.sha256"
+STATE_V6="/var/lib/ufw-blocklist6.sha256"
+
+log() { logger -t "ufw-after.init" -- "$@"; }
+
+ensure_modules() {
+  modprobe ip_set >/dev/null 2>&1 || true
+  modprobe ip_set_hash_net >/dev/null 2>&1 || true
+  modprobe xt_set >/dev/null 2>&1 || true
+}
+
+# Insert CHAIN right after loopback ACCEPT in ufw-before-input
+place_jump_after_loopback_v4() {
+  iptables -w -N "$CHAIN_V4" 2>/dev/null || true
+  # remove any existing jump; then insert at correct position
+  iptables -w -D ufw-before-input -j "$CHAIN_V4" 2>/dev/null || true
+  # find loopback ACCEPT line number
+  pos="$(iptables -w -L ufw-before-input --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$pos" ] || pos=0
+  iptables -w -I ufw-before-input $((pos+1)) -j "$CHAIN_V4"
+  log "inserted ingress jumprule at $pos"
+
+  iptables -w -D ufw-before-output -j "$CHAIN_V4" 2>/dev/null || true
+  posout="$(iptables -w -L ufw-before-output --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$posout" ] || posout=0
+  iptables -w -I ufw-before-output $((posout+1)) -j $CHAIN_V4
+  log "inserted egress jumprule at $posout"
+
+  iptables -w -D ufw-before-forward -j "$CHAIN_V4" 2>/dev/null || true
+  posfwd="$(iptables -w -L ufw-before-forward --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$posfwd" ] || posfwd=0
+  iptables -w -I ufw-before-forward $((posfwd+1)) -j $CHAIN_V4
+  log "inserted forward jumprule at $posfwd"
+
+}
+
+place_jump_after_loopback_v6() {
+  ip6tables -w -N "$CHAIN_V6" 2>/dev/null || true
+  ip6tables -w -D ufw6-before-input -j "$CHAIN_V6" 2>/dev/null || true
+  pos="$(ip6tables -w -L ufw6-before-input --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$pos" ] || pos=0
+  ip6tables -w -I ufw6-before-input $((pos+1)) -j "$CHAIN_V6"
+  log "inserted ingress jumprule at $pos"
+
+  ip6tables -w -D ufw-before-output -j "$CHAIN_V6" 2>/dev/null || true
+  posout="$(ip6tables -w -L ufw-before-output --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$posout" ] || posout=0
+  ip6tables -w -I ufw-before-output $((posout+1)) -j $CHAIN_V6
+  log "inserted egress jumprule at $posout"
+
+  ip6tables -w -D ufw-before-forward -j "$CHAIN_V6" 2>/dev/null || true
+  posfwd="$(ip6tables -w -L ufw-before-forward --line-numbers -v | awk '/ACCEPT.*lo/ {print $1; exit}')"
+  [ -n "$posfwd" ] || posfwd=0
+  ip6tables -w -I ufw-before-forward $((posfwd+1)) -j $CHAIN_V6
+  log "inserted forward jumprule at $posfwd"
+}
+
+ensure_chain_drops_v4() {
+  # ensure chain has the ipset-based DROP (at top)
+  iptables -w -C "$CHAIN_V4" -m set --match-set "$SET_V4" src -j DROP 2>/dev/null || \
+    iptables -w -I "$CHAIN_V4" 1 -m set --match-set "$SET_V4" src -j DROP
+  
+  # egress
+  iptables -w -C  "$CHAIN_V4" -m set --match-set "$SET_V4" dst -j DROP 2>/dev/null \
+    || iptables -w -I  "$CHAIN_V4" 2 -m set --match-set "$SET_V4" dst -j DROP
+
+}
+
+ensure_chain_drops_v6() {
+  ip6tables -w -C "$CHAIN_V6" -m set --match-set "$SET_V6" src -j DROP 2>/dev/null || \
+    ip6tables -w -I "$CHAIN_V6" 1 -m set --match-set "$SET_V6" src -j DROP
+
+  ip6tables -w -C "$CHAIN_V6" -m set --match-set "$SET_V6" dst -j DROP 2>/dev/null || \
+    ip6tables -w -I "$CHAIN_V6" 2 -m set --match-set "$SET_V6" dst -j DROP
+}
+
+rebuild_ipset_v4() {
+  [ -f "$IP_FILE" ] || return 0
+  ipset create "$SET_V4" hash:net family inet -exist
+  ipset create "${SET_V4}-new" hash:net family inet -exist
+  ipset flush  "${SET_V4}-new"
+  # populate new set (skip blanks/comments)
+  awk 'NF && $1 !~ /^#/' "$IP_FILE" | while read -r NET; do
+    ipset add "${SET_V4}-new" "$NET" -exist || true
+  done
+  ipset swap "$SET_V4" "${SET_V4}-new"
+  ipset destroy "${SET_V4}-new" || true
+  log "rebuild ipset from $IP_FILE"
+}
+
+rebuild_ipset_v6() {
+  [ -f "$IP6_FILE" ] || return 0
+  ipset create "$SET_V6" hash:net family inet6 -exist
+  ipset create "${SET_V6}-new" hash:net family inet6 -exist
+  ipset flush  "${SET_V6}-new"
+  awk 'NF && $1 !~ /^#/' "$IP6_FILE" | while read -r NET; do
+    ipset add "${SET_V6}-new" "$NET" -exist || true
+  done
+  ipset swap "$SET_V6" "${SET_V6}-new"
+  ipset destroy "${SET_V6}-new" || true
+}
+
+# Optional: skip rebuilds if files unchanged
+maybe_changed_v4() {
+  [ -f "$IP_FILE" ] || return 1
+  NEWSUM="$(sha256sum "$IP_FILE" | awk '{print $1}')"
+  OLDSUM="$(cat "$STATE_V4" 2>/dev/null || true)"
+  [ "$NEWSUM" = "$OLDSUM" ] && return 1 || { echo "$NEWSUM" > "$STATE_V4"; return 0; }
+}
+maybe_changed_v6() {
+  [ -f "$IP6_FILE" ] || return 1
+  NEWSUM="$(sha256sum "$IP6_FILE" | awk '{print $1}')"
+  OLDSUM="$(cat "$STATE_V6" 2>/dev/null || true)"
+  [ "$NEWSUM" = "$OLDSUM" ] && return 1 || { echo "$NEWSUM" > "$STATE_V6"; return 0; }
+}
+
+start() {
+  
+  # ensure kernel modules exist
+  ensure_modules
+  
+  # make sure the set exists in RAM (ipsets vanish on reboot)
+  ipset create $SET_V4 hash:net family inet -exist # if already exists wont create new
+  
+  # put the BLOCKLIST jump right after lo
+  place_jump_after_loopback_v4
+
+  # Rebuild ipset from file if file has changed or ipset is empty
+  if maybe_changed_v4 \
+   || ! ipset list $SET_V4 >/dev/null 2>&1 \
+   || [ "$(ipset list $SET_V4 2>/dev/null | awk '/^Number of entries:/ {print $4}')" = "0" ]; then 
+      rebuild_ipset_v4
+  else 
+    log "Sourcefile hasnt changed, skipping rebuild." 
+  fi
+
+  # Drop all entries from droplist
+  ensure_chain_drops_v4
+
+  log "blocklist wired: $(ipset list "$SET_V4" 2>/dev/null | awk '/^Number of entries:/ {print $4; exit}') IPv4 entries"
+
+  # IPv6 (optional)
+  if [ -f "$IP6_FILE" ]; then
+
+    ipset create $SET_V6 hash:net family inet -exist # if already exists wont create new
+    place_jump_after_loopback_v6
+    if maybe_changed_v6 \
+      || ! ipset list $SET_V6 >/dev/null 2>&1 \
+      || [ "$(ipset list $SET_V6 2>/dev/null | awk '/^Number of entries:/ {print $4}')" = "0" ]; then 
+        rebuild_ipset_v6;  
+    else 
+      log "Sourcefile (v6) hasnt changed, skipping rebuild." 
+    fi
+    ensure_chain_drops_v6
+
+    log "blocklist wired: $(ipset list "$SET_V6" 2>/dev/null | awk '/^Number of entries:/ {print $4; exit}') IPv6 entries"
+  fi
+}
+
+stop() {
+  # remove only the jump (don’t flush sets by default)
+  iptables  -D ufw-before-input  -j "$CHAIN_V4" 2>/dev/null || true
+  ip6tables -D ufw6-before-input -j "$CHAIN_V6" 2>/dev/null || true
+  log "blocklist jumps removed (chains/sets retained)"
+}
+
+status() {
+  echo "[IPv4] jump:"
+  iptables -L ufw-before-input --line-numbers | sed -n '1,40p' | grep -nE "BLOCKLIST|ACCEPT.*lo" || true
+  echo "[IPv4] chain:"
+  iptables -S "$CHAIN_V4" 2>/dev/null || echo "(no $CHAIN_V4)"
+  echo "[IPv4] set:"
+  ipset list "$SET_V4" 2>/dev/null | sed -n '1,20p' || echo "(no $SET_V4)"
+
+  if ip6tables -S "$CHAIN_V6" >/dev/null 2>&1; then
+    echo "[IPv6] jump:"
+    ip6tables -L ufw6-before-input --line-numbers | sed -n '1,40p' | grep -nE "BLOCKLIST6|ACCEPT.*lo" || true
+    echo "[IPv6] chain:"
+    ip6tables -S "$CHAIN_V6" || true
+    echo "[IPv6] set:"
+    ipset list "$SET_V6" 2>/dev/null | sed -n '1,20p' || echo "(no $SET_V6)"
+  fi
+}
+
+flush_all() {
+  # empty sets and chains we manage (leave the jump in place)
+  ipset flush "$SET_V4" 2>/dev/null || true
+  iptables -F "$CHAIN_V4" 2>/dev/null || true
+  ensure_chain_drops_v4
+
+  ipset flush "$SET_V6" 2>/dev/null || true
+  ip6tables -F "$CHAIN_V6" 2>/dev/null || true
+  ensure_chain_drops_v6 || true
+
+  log "blocklist flushed"
+}
+
+case "${1:-}" in
+  start)     start ;;
+  stop)      stop ;;
+  status)    status ;;
+  flush-all) flush_all ;;
+  *)
+    echo "'${1:-}' not supported"
+    echo "Usage: after.init {start|stop|flush-all|status}"
+    exit 1
+    ;;
+esac

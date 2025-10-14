@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull online blocklists and refresh UFW ipset
+After=network-online.target ufw.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/update-blocklist-sources.sh
