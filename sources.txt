@@ -1,0 +1,2 @@
+https://raw.githubusercontent.com/stamparm/ipsum/master/levels/4.txt
+https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset

@@ -1,1 +1,2 @@
 # Add whitelisted IPs here
+192.168.0.0/16

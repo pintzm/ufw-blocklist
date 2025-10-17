@@ -12,22 +12,24 @@ ALLOWLIST_V6="/etc/ufw/blocklist6-allow.txt" # optional
 USE_RELOAD=${USE_RELOAD:-false}
 
 # Example sources (replace with what you actually want to use)
-SOURCES_V4="
-https://raw.githubusercontent.com/stamparm/ipsum/master/levels/4.txt
-https://raw.githubusercontent.com/ktsaou/blocklist-ipsets/master/firehol_level1.netset
-"
-SOURCES_V6=""
+SOURCES_V4="/etc/ufw/sources.txt"
+SOURCES_V6="/etc/ufw/sources6.txt"
 
 log(){ logger -t ufw-blocklist-update -- "$@"; }
 
 fetch_all() {
-  out="$1"; shift
-  : > "$out"
-  for url in "$@"; do
+  local out="$1" urlfile="$2"
+
+  : > "$out" || { log "error: cannot write '$out'"; return 1; }
+  [ -r "$urlfile" ] || { log "error: cannot read '$urlfile'"; return 1; }
+
+  while IFS= read -r url; do
     [ -n "$url" ] || continue
     log "pulling from $url"
-    curl -fsSL "$url" | sed 's/\r$//' >> "$out" || log "warn: failed $url"
-  done
+    if ! curl -fsSL "$url" | sed 's/\r$//' >> "$out"; then
+      log "warn: failed $url"
+    fi
+  done < "$urlfile"
 }
 
 # Fetch into tmp files
@@ -72,7 +74,7 @@ changed=false
 # Rebuild ipsets only if lists changed (uses your after.init)
 if $changed; then
   if $USE_RELOAD; then
-    sudo ufw reload
+    ufw reload
     log "called ufw reload (atleast one blocklist changed and USE_RELOAD=true)"
   else
     /etc/ufw/after.init start
